@@ -20,7 +20,7 @@ from dgl import DGLGraph
 from torch import Tensor
 
 from .mesh_graph_mlp import MeshGraphMLP
-from .utils import CuGraphCSC, aggregate_and_concat
+from .utils import CuGraphCSC, aggregate_and_concat, aggregate
 
 
 class MeshNodeBlock(nn.Module):
@@ -66,7 +66,7 @@ class MeshNodeBlock(nn.Module):
         self.aggregation = aggregation
 
         self.node_mlp = MeshGraphMLP(
-            input_dim=input_dim_nodes + input_dim_edges,
+            input_dim=input_dim_nodes + input_dim_edges * 2, # multiply by 2 due to world edges
             output_dim=output_dim,
             hidden_dim=hidden_dim,
             hidden_layers=hidden_layers,
@@ -79,11 +79,17 @@ class MeshNodeBlock(nn.Module):
     def forward(
         self,
         efeat: Tensor,
+        world_efeat: Tensor,
         nfeat: Tensor,
-        graph: Union[DGLGraph, CuGraphCSC],
+        mesh_graph: Union[DGLGraph, CuGraphCSC],
+        world_graph: Union[DGLGraph, CuGraphCSC],
     ) -> Tuple[Tensor, Tensor]:
         # update edge features
-        cat_feat = aggregate_and_concat(efeat, nfeat, graph, self.aggregation)
+        efeat_new = aggregate(efeat, mesh_graph, self.aggregation)
+        # update world edge features
+        world_efeat_new = aggregate(world_efeat, world_graph, self.aggregation)
+        # concat edge + world_edge + node features
+        cat_feat = torch.cat([efeat_new, world_efeat_new, nfeat], dim=-1)
         # update node features + residual connection
         nfeat_new = self.node_mlp(cat_feat) + nfeat
-        return efeat, nfeat_new
+        return efeat, world_efeat, nfeat_new

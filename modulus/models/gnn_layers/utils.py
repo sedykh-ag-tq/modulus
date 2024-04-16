@@ -374,7 +374,36 @@ def agg_concat_dgl(
         # concat dst-node & edge features
         cat_feat = torch.cat((graph.dstdata["h_dest"], dst_nfeat), -1)
         return cat_feat
+    
+@torch.jit.ignore()
+def agg_dgl(
+    efeat: Tensor, graph: DGLGraph, aggregation: str
+) -> Tensor:
+    with graph.local_scope():
+        # populate features on graph edges
+        graph.edata["x"] = efeat
 
+        # aggregate edge features
+        if aggregation == "sum":
+            graph.update_all(fn.copy_e("x", "m"), fn.sum("m", "h_dest"))
+        elif aggregation == "mean":
+            graph.update_all(fn.copy_e("x", "m"), fn.mean("m", "h_dest"))
+        else:
+            raise RuntimeError("Not a valid aggregation!")
+
+        # get edge features
+        efeat_new = graph.dstdata["h_dest"]
+        return efeat_new
+
+def aggregate(
+    efeat: Tensor,
+    graph: DGLGraph,
+    aggregation: str, 
+):
+    efeat_new = agg_dgl(efeat, graph, aggregation)
+
+    return efeat_new
+    
 
 def aggregate_and_concat(
     efeat: Tensor,

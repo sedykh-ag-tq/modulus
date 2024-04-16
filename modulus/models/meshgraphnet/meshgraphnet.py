@@ -121,6 +121,7 @@ class MeshGraphNet(Module):
         self,
         input_dim_nodes: int,
         input_dim_edges: int,
+        input_dim_world_edges: int,
         output_dim: int,
         processor_size: int = 15,
         mlp_activation_fn: Union[str, List[str]] = "relu",
@@ -143,6 +144,16 @@ class MeshGraphNet(Module):
 
         self.edge_encoder = MeshGraphMLP(
             input_dim_edges,
+            output_dim=hidden_dim_processor,
+            hidden_dim=hidden_dim_edge_encoder,
+            hidden_layers=num_layers_edge_encoder,
+            activation_fn=activation_fn,
+            norm_type="LayerNorm",
+            recompute_activation=False,
+        )
+
+        self.world_edge_encoder = MeshGraphMLP(
+            input_dim_world_edges,
             output_dim=hidden_dim_processor,
             hidden_dim=hidden_dim_edge_encoder,
             hidden_layers=num_layers_edge_encoder,
@@ -187,11 +198,16 @@ class MeshGraphNet(Module):
         self,
         node_features: Tensor,
         edge_features: Tensor,
-        graph: Union[DGLGraph, List[DGLGraph], CuGraphCSC],
+        world_edge_features: Tensor,
+        mesh_graph: Union[DGLGraph, List[DGLGraph], CuGraphCSC],
+        world_graph: Union[DGLGraph, List[DGLGraph], CuGraphCSC],
     ) -> Tensor:
         edge_features = self.edge_encoder(edge_features)
+        world_edge_features = self.world_edge_encoder(world_edge_features)
         node_features = self.node_encoder(node_features)
-        x = self.processor(node_features, edge_features, graph)
+
+        x = self.processor(node_features, edge_features, world_edge_features, mesh_graph, world_graph)
+
         x = self.node_decoder(x)
         return x
 
@@ -227,6 +243,10 @@ class MeshGraphNetProcessor(nn.Module):
             do_concat_trick,
             False,
         )
+
+        # after encoding, latent representation of world edges and mesh edges are the same
+        world_edge_block_invars = edge_block_invars
+        
         node_block_invars = (
             aggregation,
             input_dim_node,
@@ -242,10 +262,13 @@ class MeshGraphNetProcessor(nn.Module):
         edge_blocks = [
             MeshEdgeBlock(*edge_block_invars) for _ in range(self.processor_size)
         ]
+        world_edge_blocks = [
+            MeshEdgeBlock(*world_edge_block_invars) for _ in range(self.processor_size)
+        ]
         node_blocks = [
             MeshNodeBlock(*node_block_invars) for _ in range(self.processor_size)
         ]
-        layers = list(chain(*zip(edge_blocks, node_blocks)))
+        layers = list(chain(*zip(edge_blocks, world_edge_blocks, node_blocks)))
 
         self.processor_layers = nn.ModuleList(layers)
         self.num_processor_layers = len(self.processor_layers)
@@ -304,14 +327,25 @@ class MeshGraphNetProcessor(nn.Module):
         def custom_forward(
             node_features: Tensor,
             edge_features: Tensor,
-            graph: Union[DGLGraph, List[DGLGraph]],
+            world_edge_features: Tensor,
+            mesh_graph: Union[DGLGraph, List[DGLGraph]],
+            world_graph: Union[DGLGraph, List[DGLGraph]],
         ) -> Tuple[Tensor, Tensor]:
             """Custom forward function"""
-            for module in segment:
-                edge_features, node_features = module(
-                    edge_features, node_features, graph
-                )
-            return edge_features, node_features
+            for i, module in enumerate(segment):
+                if i % 3 == 1: # if module is world_edge_block
+                    world_edge_features, node_features = module(
+                        world_edge_features, node_features, world_graph
+                    )
+                elif i % 3 == 2: # if module is node_block:
+                    edge_features, world_edge_features, node_features = module(
+                        edge_features, world_edge_features, node_features, mesh_graph, world_graph
+                    )
+                else: # if module is either edge_block
+                    edge_features, node_features = module(
+                        edge_features, node_features, mesh_graph
+                    )
+            return edge_features, world_edge_features, node_features
 
         return custom_forward
 
@@ -320,14 +354,18 @@ class MeshGraphNetProcessor(nn.Module):
         self,
         node_features: Tensor,
         edge_features: Tensor,
-        graph: Union[DGLGraph, List[DGLGraph], CuGraphCSC],
+        world_edge_features: Tensor,
+        mesh_graph: Union[DGLGraph, List[DGLGraph], CuGraphCSC],
+        world_graph: Union[DGLGraph, List[DGLGraph], CuGraphCSC],
     ) -> Tensor:
         for segment_start, segment_end in self.checkpoint_segments:
-            edge_features, node_features = self.checkpoint_fn(
+            edge_features, world_edge_features, node_features = self.checkpoint_fn( # usually gets called only once
                 self.run_function(segment_start, segment_end),
                 node_features,
                 edge_features,
-                graph,
+                world_edge_features,
+                mesh_graph,
+                world_graph,
                 use_reentrant=False,
                 preserve_rng_state=False,
             )
